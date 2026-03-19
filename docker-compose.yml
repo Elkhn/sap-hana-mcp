@@ -1,0 +1,15 @@
+---
+      
+services:
+  sap-mcp:
+    container_name: SAP-MCP
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    restart: unless-stopped
