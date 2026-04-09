@@ -2,9 +2,13 @@ import os
 import csv
 import io
 import logging
+import base64
+import httpx
+from bs4 import BeautifulSoup
 from hdbcli import dbapi
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import CurrentHeaders
 
 load_dotenv()
 
@@ -25,13 +29,35 @@ FORMAT_DESC = "The output will be returned in CSV format, with the first line co
 mcp = FastMCP("SAP HANA MCP Server")
 
 
-def _get_connection():
-    """Create a new SAP HANA database connection."""
+def _parse_basic_auth(headers: dict) -> tuple[str, str]:
+    """Extract username and password from Authorization: Basic header."""
+    auth = headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return "", ""
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        user, password = decoded.split(":", 1)
+        return user, password
+    except Exception:
+        return "", ""
+
+
+def _get_connection(headers: dict = None):
+    """Create a new SAP HANA database connection.
+
+    Uses credentials from the Authorization header if provided,
+    otherwise falls back to environment variables.
+    """
+    user, password = "", ""
+    if headers:
+        user, password = _parse_basic_auth(headers)
+    if not user or not password:
+        raise RuntimeError("Authorization required. Provide an Authorization: Basic header with SAP HANA credentials.")
     return dbapi.connect(
         address=HANA_HOST,
         port=HANA_PORT,
-        user=HANA_USER,
-        password=HANA_PASSWORD
+        user=user,
+        password=password
     )
 
 
@@ -61,7 +87,7 @@ def _resultset_to_csv(cursor, columns=None):
 
 
 @mcp.tool()
-async def sap_hana_get_tables(catalog: str = "", schema: str = "") -> str:
+async def sap_hana_get_tables(catalog: str = "", schema: str = "", headers: dict = CurrentHeaders()) -> str:
     """Retrieves a list of tables available in the SAP HANA data source.
 
     Use the `sap_hana_get_columns` tool to list available columns on a table.
@@ -76,7 +102,7 @@ async def sap_hana_get_tables(catalog: str = "", schema: str = "") -> str:
     effective_schema = schema or HANA_SCHEMA
 
     try:
-        conn = _get_connection()
+        conn = _get_connection(headers)
         cursor = conn.cursor()
 
         query = """
@@ -112,7 +138,7 @@ async def sap_hana_get_tables(catalog: str = "", schema: str = "") -> str:
 
 
 @mcp.tool()
-async def sap_hana_get_columns(table: str, catalog: str = "", schema: str = "") -> str:
+async def sap_hana_get_columns(table: str, catalog: str = "", schema: str = "", headers: dict = CurrentHeaders()) -> str:
     """Retrieves a list of columns for a table in SAP HANA.
 
     Use the `sap_hana_get_tables` tool to get a list of available tables.
@@ -127,7 +153,7 @@ async def sap_hana_get_columns(table: str, catalog: str = "", schema: str = "") 
     effective_schema = schema or HANA_SCHEMA
 
     try:
-        conn = _get_connection()
+        conn = _get_connection(headers)
         cursor = conn.cursor()
 
         query = """
@@ -159,7 +185,7 @@ async def sap_hana_get_columns(table: str, catalog: str = "", schema: str = "") 
 
 
 @mcp.tool()
-async def sap_hana_run_query(sql: str) -> str:
+async def sap_hana_run_query(sql: str, headers: dict = CurrentHeaders()) -> str:
     """Execute a SQL SELECT statement against SAP HANA.
 
     Use the `sap_hana_get_tables` tool to get a list of available tables,
@@ -175,7 +201,7 @@ async def sap_hana_run_query(sql: str) -> str:
     logger.info("sap_hana_run_query(%s)", sql)
 
     try:
-        conn = _get_connection()
+        conn = _get_connection(headers)
         cursor = conn.cursor()
         cursor.execute(sql)
 
@@ -189,7 +215,7 @@ async def sap_hana_run_query(sql: str) -> str:
 
 
 @mcp.resource("sap_hana://tables/{schema}/{table}")
-async def get_table_metadata(schema: str, table: str) -> str:
+async def get_table_metadata(schema: str, table: str, headers: dict = CurrentHeaders()) -> str:
     """Get column metadata for a specific table.
 
     Args:
@@ -197,7 +223,7 @@ async def get_table_metadata(schema: str, table: str) -> str:
         table: The table name
     """
     try:
-        conn = _get_connection()
+        conn = _get_connection(headers)
         cursor = conn.cursor()
 
         cursor.execute(
@@ -223,6 +249,76 @@ async def get_table_metadata(schema: str, table: str) -> str:
 
     except Exception as ex:
         raise RuntimeError(f"ERROR: {ex}")
+
+
+async def _fetch_leanx_table(table_name: str):
+    """Fetch and parse SAP table metadata from leanx.eu using httpx + BeautifulSoup."""
+    url = f"https://leanx.eu/sap/table/{table_name.lower()}/"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers={"User-Agent": "sap-hana-mcp/0.1"})
+
+    if resp.status_code == 404:
+        return None, []
+
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Table description from the h2 subtitle
+    h2 = soup.find("h2", class_="text-xl")
+    description = h2.get_text(strip=True) if h2 else ""
+
+    # Field rows from the main data table (skip thead)
+    fields = []
+    table_el = soup.find("table")
+    if table_el:
+        tbody = table_el.find("tbody")
+        if tbody:
+            for tr in tbody.find_all("tr"):
+                cells = tr.find_all("td")
+                if len(cells) < 6:
+                    continue
+                # Cell 0: field name (first div) + description (second div)
+                divs = cells[0].find_all("div")
+                field_name = divs[0].get_text(strip=True) if divs else ""
+                field_desc = divs[1].get_text(strip=True) if len(divs) > 1 else ""
+                data_element = cells[1].get_text(strip=True)
+                datatype = cells[3].find("div").get_text(strip=True) if cells[3].find("div") else cells[3].get_text(strip=True)
+                length = cells[4].get_text(strip=True)
+                decimals = cells[5].get_text(strip=True)
+                fields.append((field_name, field_desc, data_element, datatype, length, decimals))
+
+    return description, fields
+
+
+@mcp.tool()
+async def sap_hana_lookup_table_info(table: str) -> str:
+    """Look up SAP table and field descriptions from an external reference (leanx.eu).
+
+    Use this when SAP HANA system catalog has no comments/descriptions for tables or columns.
+    Returns the table description and a CSV of fields with their metadata.
+
+    Args:
+        table: The SAP table name (e.g. ANLA, BKPF, MARA)
+    """
+    logger.info("sap_hana_lookup_table_info(table=%s)", table)
+
+    description, fields = await _fetch_leanx_table(table)
+
+    if description is None:
+        return f"Table '{table.upper()}' not found on leanx.eu."
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    if description:
+        output.write(f"Table: {table.upper()}\n")
+        output.write(f"Description: {description}\n\n")
+
+    writer.writerow(["Field", "Description", "DataElement", "Datatype", "Length", "Decimals"])
+    for field_name, field_desc, data_element, datatype, length, decimals in fields:
+        writer.writerow([field_name, field_desc, data_element, datatype, length, decimals])
+
+    return output.getvalue()
 
 
 if __name__ == "__main__":

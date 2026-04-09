@@ -19,3 +19,15 @@ venv/
 
 # uv
 uv.lock
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# OpenAI Codex
+.codex/
+AGENTS.md
+
+# Cursor
+.cursor/
+.cursorules
